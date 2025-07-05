@@ -1,4 +1,5 @@
-git remote add origin https://github.com/ThaoFPham/final_project.gitFROM python:3.10-slim
+#git remote add origin https://github.com/ThaoFPham/final_project.gitFROM python:3.10-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
