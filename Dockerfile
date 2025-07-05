@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+git remote add origin https://github.com/ThaoFPham/final_project.gitFROM python:3.10-slim
 
 WORKDIR /app
 
@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 10000
 
-CMD ["streamlit", "run", "streamlit_project01.py", "--server.port=10000", "--server.enableCORS=false"]
+CMD ["streamlit", "run", "class.py", "--server.port=10000", "--server.enableCORS=false"]

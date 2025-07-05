@@ -561,7 +561,6 @@ with tab1:
         - **Cosine Similarity**: Đo độ tương đồng giữa các vector mô tả
         """)
 
-        print("✅ Dictionaries loaded:", len(ml_system.text_processor.english_dict))
     #2.1.2.  Recommendation
     elif page == "Recommendation":
         st.markdown('<h1 class="main-header">🎯 Business Objective</h1>', unsafe_allow_html=True)
