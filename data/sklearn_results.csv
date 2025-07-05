@@ -1,0 +1,6 @@
+,Sklearn Accuracy
+Random Forest,0.9847328244274809
+Logistic Regression,1.0
+Naive Bayes,0.916030534351145
+Decision Tree,0.9847328244274809
+KNN,0.9083969465648855

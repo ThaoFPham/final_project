@@ -2,35 +2,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 import re
 import string
 import os
+import json
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.naive_bayes import GaussianNB
-from sklearn.svm import SVC
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import accuracy_score, classification_report, silhouette_score
-from sklearn.model_selection import train_test_split
 from sklearn.metrics.pairwise import cosine_similarity
 import pickle
 from gensim import corpora, models, similarities
-
-try:
-    from pyspark.sql import SparkSession
-    from pyspark.sql.types import StructType, StructField, IntegerType, StringType, DoubleType
-    from pyspark.ml.feature import VectorAssembler, StringIndexer
-    from pyspark.ml.classification import LogisticRegression as SparkLogisticRegression, DecisionTreeClassifier as SparkDecisionTreeClassifier
-    from pyspark.ml.evaluation import MulticlassClassificationEvaluator
-    from pyspark.ml import Pipeline
-    PYSPARK_AVAILABLE = True
-except ImportError:
-    PYSPARK_AVAILABLE = False
 
 # Cấu hình trang
 st.set_page_config(
@@ -125,11 +105,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Khởi tạo session state
-if 'data_loaded' not in st.session_state:
-    st.session_state.data_loaded = False
-if 'model_trained' not in st.session_state:
-    st.session_state.model_trained = False
+# 1️⃣ Khởi tạo session_state cho các biến đơn giản
+default_state = {
+    "data_loaded": False,
+    "model_trained": False,
+    "selectbox_company": "-- Chọn công ty --",
+    "query_text": "",
+    "prev_selectbox_company": "-- Chọn công ty --",
+    "prev_query_text": ""
+}
+for key, value in default_state.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 # Class xử lý văn bản tích hợp từ code của bạn
 class TextProcessor:
@@ -137,6 +124,7 @@ class TextProcessor:
         self.teen_dict = {}
         self.stopwords_lst = []
         self.wrong_lst = []
+        self.english_dict = {}
         self.load_dictionaries()
     
     def load_dictionaries(self):
@@ -185,6 +173,24 @@ class TextProcessor:
                     break
             else:
                 self.wrong_lst = ['zzz', 'xxx', 'aaa', 'bbb', 'ccc']
+
+            # Load english-vnmese dictionary từ file hoặc fallback nếu không tồn tại
+            english_dict_paths = ['files/english-vnmese_rev.txt', 'english-vnmese_rev.txt']
+            for path in english_dict_paths:
+                if os.path.exists(path):
+                    with open(path, 'r', encoding='utf8') as file:
+                        for line in file:
+                            if '\t' in line:
+                                key, value = line.strip().split('\t', 1)
+                                self.english_dict[key] = value
+                    break
+            else:
+                # Fallback từ điển đơn giản nếu không có file
+                self.english_dict = {
+                    "hello": "xin chào",
+                    "world": "thế giới",
+                    "example": "ví dụ",
+                    "test": "kiểm tra"}
                     
         except Exception as e:
             st.warning(f"⚠️ Không thể load một số file từ điển: {e}")
@@ -199,6 +205,22 @@ class TextProcessor:
         text = re.sub(r"\s+", " ", text).strip()  # Xóa khoảng trắng thừa
         text = re.sub(r"^[\-\+\*\•\●\·\~\–\—\>]+", "", text)  # Bỏ dấu đầu câu
         return text
+    
+    def translate_english(self,text):
+        """Dịch từ tiếng Anh sang tiếng Việt nếu phát hiện văn bản là tiếng Anh"""
+        def is_english(text):
+            if not text:
+                return False
+            text = text.lower()
+            eng_chars = re.findall(r"[a-z]", text)
+            non_eng_chars = re.findall(r"[à-ỹ]", text.lower())
+            return len(eng_chars) > len(non_eng_chars)
+
+        if not is_english(text):
+            return text  # Nếu không phải tiếng Anh thì giữ nguyên
+        words = text.split()
+        translated = [self.english_dict.get(word, word) for word in words]
+        return " ".join(translated)
     
     def fix_teencode(self, text):
         """Sửa teencode - tích hợp từ code của bạn"""
@@ -223,6 +245,7 @@ class TextProcessor:
         if not text or pd.isna(text):
             return ""
         text = self.clean_text(text)
+        text = self.translate_english(text)
         text = self.fix_teencode(text)
         text = self.remove_wrongword(text)
         text = self.remove_stopword(text)
@@ -240,338 +263,6 @@ class CompanyRecommendationSystem:
         self.text_processor = TextProcessor()
         self.structured_cols = ['Company Type', 'Company industry', 'Company size', 'Country', 'Working days', 'Overtime Policy']
         self.text_cols = ['Company overview_new', "Why you'll love working here_new", 'Our key skills_new', 'keyword']
-        
-    @st.cache_data
-    def load_data(_self):
-        """Load và xử lý dữ liệu thực - KHÔNG tạo sample data"""
-        try:
-            # Đường dẫn file dữ liệu thực
-            data_paths = {
-                'translated_data': 'data/translated_data.csv',
-                'top2_clusters': 'data/top2_clusters_per_company.csv', 
-                'sentiment_data': 'data/sentiment_by_company.csv'
-            }
-            
-            # Kiểm tra file tồn tại
-            missing_files = []
-            for name, path in data_paths.items():
-                if not os.path.exists(path):
-                    missing_files.append(path)
-            
-            if missing_files:
-                st.markdown(f"""
-                <div class="error-box">
-                    <h4>❌ Không tìm thấy các file dữ liệu cần thiết:</h4>
-                    <ul>
-                        {''.join([f'<li>{file}</li>' for file in missing_files])}
-                    </ul>
-                    <p><strong>Hướng dẫn:</strong></p>
-                    <ol>
-                        <li>Tạo thư mục <code>data/</code> trong project</li>
-                        <li>Upload các file CSV vào thư mục <code>data/</code></li>
-                        <li>Đảm bảo tên file chính xác như trên</li>
-                        <li>Refresh lại trang</li>
-                    </ol>
-                </div>
-                """, unsafe_allow_html=True)
-                return False
-            
-            # Load dữ liệu thực
-            st.info("📂 Đang load dữ liệu thực từ files...")
-            
-            with st.spinner("Loading translated_data.csv..."):
-                clustercty = pd.read_csv(data_paths['translated_data'])
-                st.success(f"✅ Loaded {len(clustercty)} companies from translated_data.csv")
-            
-            with st.spinner("Loading cluster data..."):
-                new_data = pd.read_csv(data_paths['top2_clusters'])
-                st.success(f"✅ Loaded {len(new_data)} cluster records")
-            
-            with st.spinner("Loading sentiment data..."):
-                sentiment_cln = pd.read_csv(data_paths['sentiment_data'])
-                st.success(f"✅ Loaded {len(sentiment_cln)} sentiment records")
-            
-            # Kiểm tra dữ liệu không trống
-            if clustercty.empty or new_data.empty or sentiment_cln.empty:
-                st.error("❌ Một hoặc nhiều file CSV trống! Vui lòng kiểm tra dữ liệu.")
-                return False
-            
-            # Merge dữ liệu theo logic của bạn
-            st.info("🔗 Đang merge dữ liệu...")
-            new_data = pd.merge(new_data, sentiment_cln[['Company Name','sentiment_group']], on='Company Name', how='left')
-            clustercty = clustercty.merge(new_data[['Company Name', 'keyword', 'sentiment_group']], on='Company Name', how='left')
-            
-            # Xử lý cột không cần thiết
-            if 'Unnamed: 0' in clustercty.columns:
-                clustercty.drop(columns=['Unnamed: 0'], inplace=True)
-            
-            # Điền giá trị null
-            clustercty['keyword'].fillna('không xác định', inplace=True)
-            clustercty['sentiment_group'].fillna('neutral', inplace=True)
-            
-            # Kiểm tra các cột cần thiết
-            required_cols = _self.structured_cols + _self.text_cols
-            missing_cols = [col for col in required_cols if col not in clustercty.columns]
-            
-            if missing_cols:
-                st.error(f"❌ Thiếu các cột cần thiết: {missing_cols}")
-                st.info("📋 Các cột có sẵn: " + ", ".join(clustercty.columns.tolist()))
-                return False
-            
-            # Lưu dữ liệu
-            _self.clustercty = clustercty
-            st.success(f"🎉 Load dữ liệu thành công: {len(clustercty)} công ty với đầy đủ thông tin!")
-            
-            # Hiển thị thống kê
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("📊 Tổng công ty", len(clustercty))
-            with col2:
-                st.metric("🏭 Số ngành", clustercty['Company industry'].nunique())
-            with col3:
-                st.metric("😊 Có sentiment", clustercty['sentiment_group'].notna().sum())
-            with col4:
-                st.metric("🔑 Có keywords", clustercty['keyword'].notna().sum())
-            
-            return True
-            
-        except Exception as e:
-            st.markdown(f"""
-            <div class="error-box">
-                <h4>❌ Lỗi load dữ liệu:</h4>
-                <p><strong>Chi tiết lỗi:</strong> {str(e)}</p>
-                <p><strong>Hướng dẫn khắc phục:</strong></p>
-                <ol>
-                    <li>Kiểm tra format file CSV (UTF-8 encoding)</li>
-                    <li>Đảm bảo các cột cần thiết có trong file</li>
-                    <li>Kiểm tra đường dẫn file</li>
-                    <li>Thử load từng file riêng lẻ để debug</li>
-                </ol>
-            </div>
-            """, unsafe_allow_html=True)
-            return False
-    
-    def prepare_features(self):
-        """Chuẩn bị features với error handling tốt hơn"""
-        try:
-            if self.clustercty is None or self.clustercty.empty:
-                st.error("❌ Dữ liệu chưa được load hoặc trống!")
-                return False
-            
-            st.info("🔧 Đang chuẩn bị features...")
-            
-            # Kiểm tra các cột text
-            text_cols_available = [col for col in self.text_cols if col in self.clustercty.columns]
-            if not text_cols_available:
-                st.error(f"❌ Không tìm thấy cột text nào trong: {self.text_cols}")
-                return False
-            
-            st.info(f"📝 Sử dụng các cột text: {text_cols_available}")
-            
-            # Xử lý văn bản với text processor
-            with st.spinner("Đang xử lý văn bản..."):
-                self.clustercty['combined_text'] = self.clustercty[text_cols_available].fillna('').agg(' '.join, axis=1)
-                self.clustercty['combined_text'] = self.clustercty['combined_text'].apply(self.text_processor.clean_pipeline)
-            
-            # Kiểm tra kết quả xử lý text
-            if self.clustercty['combined_text'].isna().all():
-                st.error("❌ Tất cả combined_text đều null sau khi xử lý!")
-                return False
-            
-            # TF-IDF
-            with st.spinner("Đang thực hiện TF-IDF vectorization..."):
-                tfidf_matrix = self.tfidf.fit_transform(self.clustercty['combined_text'])
-                df_tfidf = pd.DataFrame(
-                    tfidf_matrix.toarray(),
-                    columns=self.tfidf.get_feature_names_out()
-                )
-            
-            st.success(f"✅ TF-IDF: {df_tfidf.shape[1]} features")
-            
-            # Kiểm tra các cột structured
-            structured_cols_available = [col for col in self.structured_cols if col in self.clustercty.columns]
-            if not structured_cols_available:
-                st.error(f"❌ Không tìm thấy cột structured nào trong: {self.structured_cols}")
-                return False
-            
-            st.info(f"🏗️ Sử dụng các cột structured: {structured_cols_available}")
-            
-            # One-hot encode
-            with st.spinner("Đang thực hiện One-hot encoding..."):
-                self.df_structured_encoded = pd.get_dummies(self.clustercty[structured_cols_available], drop_first=True)
-            
-            st.success(f"✅ One-hot encoding: {self.df_structured_encoded.shape[1]} features")
-            
-            # Gộp dữ liệu
-            X_concat = pd.concat([
-                self.df_structured_encoded.reset_index(drop=True), 
-                df_tfidf.reset_index(drop=True)
-            ], axis=1)
-            
-            st.info(f"🔗 Combined features: {X_concat.shape[1]} total features")
-            
-            # PCA
-            with st.spinner("Đang thực hiện PCA dimensionality reduction..."):
-                n_components = min(50, X_concat.shape[1] - 1, X_concat.shape[0] - 1)
-                self.pca = PCA(n_components=n_components, random_state=42)
-                self.X_full = self.pca.fit_transform(X_concat)
-            
-            st.success(f"✅ PCA completed: {self.X_full.shape[1]} components")
-            
-            return True
-            
-        except Exception as e:
-            st.error(f"❌ Lỗi chuẩn bị features: {str(e)}")
-            return False
-    
-    def find_optimal_clusters(self):
-        """Tìm số cluster tối ưu"""
-        K = range(2, min(11, len(self.clustercty)))
-        silhouette_scores = []
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for i, k in enumerate(K):
-            status_text.text(f'Đang test k={k}...')
-            kmeans = KMeans(n_clusters=k, random_state=42)
-            labels = kmeans.fit_predict(self.X_full)
-            score = silhouette_score(self.X_full, labels)
-            silhouette_scores.append(score)
-            progress_bar.progress((i + 1) / len(K))
-        
-        status_text.empty()
-        progress_bar.empty()
-        
-        best_k = K[silhouette_scores.index(max(silhouette_scores))]
-        
-        # Visualize silhouette scores
-        fig = px.line(x=list(K), y=silhouette_scores, 
-                     title="Silhouette Score vs Number of Clusters",
-                     labels={'x': 'Number of Clusters (k)', 'y': 'Silhouette Score'})
-        fig.add_vline(x=best_k, line_dash="dash", line_color="red", 
-                     annotation_text=f"Best k={best_k}")
-        st.plotly_chart(fig, use_container_width=True)
-        
-        return best_k, silhouette_scores
-    
-    def train_models(self):
-        """Training các mô hình"""
-        try:
-            # Tìm số cluster tối ưu
-            best_k, silhouette_scores = self.find_optimal_clusters()
-        
-            # Clustering với k tối ưu
-            final_kmeans = KMeans(n_clusters=best_k, random_state=42)
-            cluster_labels = final_kmeans.fit_predict(self.X_full)
-            self.clustercty['cluster'] = cluster_labels
-        
-            # Chia train/test
-            X_train, X_test, y_train, y_test = train_test_split(
-                self.X_full, cluster_labels, test_size=0.2, random_state=42
-            )
-        
-            # Các mô hình
-            models = {
-                "Random Forest": RandomForestClassifier(n_estimators=50),
-                "Logistic Regression": LogisticRegression(max_iter=500),
-                "Naive Bayes": GaussianNB(),
-                "Decision Tree": DecisionTreeClassifier(max_depth=10),
-                "KNN": KNeighborsClassifier(n_neighbors=3)
-            }
-        
-            results = []
-            trained_models = {}
-        
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-        
-            for i, (name, model) in enumerate(models.items()):
-                status_text.text(f'Training {name}...')
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                acc = accuracy_score(y_test, y_pred)
-                results.append((name, acc))
-                trained_models[name] = model
-                progress_bar.progress((i + 1) / len(models))
-        
-            status_text.empty()
-            progress_bar.empty()
-            
-            # Chọn mô hình tốt nhất
-            best_model_name, best_acc = max(results, key=lambda x: x[1])
-            self.best_model = trained_models[best_model_name]
-        
-            st.success(f"🏆 Mô hình tốt nhất: {best_model_name} với accuracy: {best_acc:.3f}")
-        
-            return results, best_model_name, best_acc, best_k
-        
-        except Exception as e:
-            st.error(f"❌ Lỗi training models: {e}")
-            return [], "", 0, 0
-    
-    def recommend_companies(self, user_input, text_input, threshold=0.1):
-        """Đề xuất công ty"""
-        try:
-            # Xử lý text input
-            cleaned_text = self.text_processor.clean_pipeline(text_input)
-            tfidf_vec = self.tfidf.transform([cleaned_text])
-            
-            # Xử lý structured input
-            structured_df = pd.DataFrame([user_input])
-            structured_encoded = pd.get_dummies(structured_df)
-            
-            # Đảm bảo có đủ columns
-            missing_cols = set(self.df_structured_encoded.columns) - set(structured_encoded.columns)
-            for col in missing_cols:
-                structured_encoded[col] = 0
-            structured_encoded = structured_encoded[self.df_structured_encoded.columns]
-            
-            # Gộp features
-            user_input_vector = pd.concat([
-                structured_encoded.reset_index(drop=True), 
-                pd.DataFrame(tfidf_vec.toarray(), columns=self.tfidf.get_feature_names_out())
-            ], axis=1)
-            
-            # PCA transform
-            user_input_pca = self.pca.transform(user_input_vector)
-            
-            # Predict cluster
-            predicted_cluster = self.best_model.predict(user_input_pca)[0]
-            
-            # Tính Cosine Similarity
-            company_text_vectors = self.tfidf.transform(self.clustercty['combined_text'])
-            similarity_scores = cosine_similarity(tfidf_vec, company_text_vectors).flatten()
-            self.clustercty['similarity_score'] = similarity_scores
-            
-            # Lọc công ty
-            matched = self.clustercty[
-                (self.clustercty['cluster'] == predicted_cluster) & 
-                (self.clustercty['similarity_score'] >= threshold)
-            ].copy()
-            
-            matched = matched.sort_values(by='similarity_score', ascending=False).head(10)
-            
-            return matched, predicted_cluster
-            
-        except Exception as e:
-            st.error(f"❌ Lỗi đề xuất: {e}")
-            return pd.DataFrame(), -1
-    
-    def get_companies_by_cluster_sentiment(self, cluster_id=None, sentiment=None):
-        """Lấy công ty theo cluster và sentiment"""
-        if self.clustercty is None:
-            return pd.DataFrame()
-        
-        filtered_data = self.clustercty.copy()
-        
-        if cluster_id is not None:
-            filtered_data = filtered_data[filtered_data['cluster'] == cluster_id]
-        
-        if sentiment is not None:
-            filtered_data = filtered_data[filtered_data['sentiment_group'] == sentiment]
-        
-        return filtered_data
 
     def load_gensim_models(self):
         """Load pre-trained Gensim models"""
@@ -685,9 +376,8 @@ class CompanyRecommendationSystem:
 
         return top_similarity_cos_search , df_cos_search, query_text_2
 
-
    # Hàm lấy index từ danh sách công ty chọn
-    def suggest_company_name(self, df, key = None):
+    def suggest_company_name(self, df, key = None, on_change=None):
         # Tạo mapping: tên công ty → id (nếu tên trùng nhau sẽ lấy ID đầu tiên)
         company_mapping = (df.set_index("Company Name")["id"].to_dict())
         # Danh sách tên công ty, thêm lựa chọn đầu tiên là "Tất cả" hoặc "-- Chọn công ty --"
@@ -695,9 +385,10 @@ class CompanyRecommendationSystem:
 
         # Tạo selectbox
         selected_name = st.selectbox(
-            "Nhập tên công ty:",
+            "Choose company:",
             options=company_list,
-            key=key)
+            key=key,
+            on_change=on_change)
         
         # Nếu người dùng chưa chọn công ty cụ thể → trả None
         if selected_name == "-- Chọn công ty --":
@@ -736,10 +427,10 @@ class CompanyRecommendationSystem:
                 st.markdown("**🔧 Kỹ năng cần thiết:**")
                 st.write(data.get('Our key skills', 'Không có thông tin'))
 
-    def draw_similarity_bar_chart(self,df):
-        df["similarity"] = df["similarity"].clip(0, 1)
+    def draw_similarity_bar_chart(self,data):
+        data["similarity"] = data["similarity"].clip(0, 1)
         # Sắp xếp dữ liệu tăng dần theo similarity
-        df_sorted = df.sort_values(by="similarity", ascending=True)
+        df_sorted = data.sort_values(by="similarity", ascending=True)
 
         # Tạo biểu đồ
         fig = px.bar(
@@ -769,117 +460,56 @@ class CompanyRecommendationSystem:
         fig.update_traces(texttemplate='%{text:.4f}', textposition='outside', textfont=dict(color='#0D47A1'))
 
         st.plotly_chart(fig, use_container_width=True)
-
-import subprocess
-class PySparkMLSystem:
-    def __init__(self):
-        self.spark = None
-        self.spark_df_ml = None
-        self.pyspark_results = {}
-
-    def initialize_spark(self):
-        """Khởi tạo Spark Session với kiểm tra Java"""
-        try:
-            # Kiểm tra java -version
-            result = subprocess.run(['java', '-version'], capture_output=True, text=True)
-            if result.returncode != 0:
-                st.error("❌ Java không được cài đặt hoặc không trong PATH")
-                return False
-        except FileNotFoundError:
-            st.error("❌ Java không được tìm thấy. Vui lòng cài đặt Java 8 hoặc 11.")
-            return False
-
-        try:
-            # Tạo SparkSession an toàn
-            self.spark = SparkSession.builder \
-                .appName("CompanyRecommendation") \
-                .config("spark.driver.memory", "2g") \
-                .config("spark.executor.memory", "2g") \
-                .config("spark.sql.adaptive.enabled", "true") \
-                .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-                .getOrCreate()
-
-            # Test Spark bằng cách tạo DataFrame
-            test_df = self.spark.createDataFrame([(1, "test")], ["id", "value"])
-            test_df.count()  # ép thực thi
-
-            self.spark.sparkContext.setLogLevel("ERROR")
-            st.success("✅ Spark đã được khởi tạo thành công!")
-            return True
-
-        except Exception as e:
-            st.error(f"❌ Lỗi khởi tạo Spark: {e}")
-            return False
-
     
-    def prepare_spark_data(self, X_concat, cluster_labels):
-        """Chuẩn bị dữ liệu cho PySpark"""
-        try:
-            # Thêm cluster labels vào X_concat
-            X_concat_with_labels = X_concat.copy()
-            X_concat_with_labels['cluster'] = cluster_labels
-            
-            # Convert to Spark DataFrame
-            self.spark_df_ml = self.spark.createDataFrame(X_concat_with_labels)
-            
-            # Assemble features
-            feature_columns = X_concat.columns.tolist()
-            assembler = VectorAssembler(inputCols=feature_columns, outputCol="features")
-            self.spark_df_ml = assembler.transform(self.spark_df_ml)
-            
-            # Select features and labels
-            self.spark_df_ml = self.spark_df_ml.select("features", "cluster")
-            
-            return True
-            
-        except Exception as e:
-            st.error(f"❌ Lỗi chuẩn bị dữ liệu Spark: {e}")
-            return False
-    
-    def train_pyspark_models(self):
-        """Training PySpark models"""
-        try:
-            # Split data
-            train_data, test_data = self.spark_df_ml.randomSplit([0.8, 0.2], seed=42)
-            
-            # Evaluator
-            evaluator = MulticlassClassificationEvaluator(
-                labelCol="cluster", 
-                predictionCol="prediction", 
-                metricName="accuracy"
+    def show_similarity_results(self, data, cols_show=None):
+        """Hiển thị biểu đồ, bảng và chi tiết công ty tương đồng"""
+        
+        st.subheader("🏢 Công ty tương đồng:")
+        subtab1, subtab2 = st.tabs(["📊 Biểu đồ", "📋 Dữ liệu"])
+
+        with subtab1:
+            self.draw_similarity_bar_chart(data)
+
+        with subtab2:
+            if cols_show is None:
+                cols_show = ["Company Name", "similarity"]
+            st.dataframe(data[cols_show].style.format({"similarity": "{:.4f}"}))
+
+        st.subheader("🏢 Thông tin công ty tương đồng:")
+        for idx, row in data.iterrows():
+            self.show_company_detail(
+                row,
+                title=f"{row['Company Name']} (Similarity: {row['similarity']:.4f})"
             )
-            
-            # Logistic Regression
-            lr = SparkLogisticRegression(featuresCol="features", labelCol="cluster")
-            lr_model = lr.fit(train_data)
-            lr_predictions = lr_model.transform(test_data)
-            lr_accuracy = evaluator.evaluate(lr_predictions)
-            
-            # Decision Tree
-            dt = SparkDecisionTreeClassifier(featuresCol="features", labelCol="cluster")
-            dt_model = dt.fit(train_data)
-            dt_predictions = dt_model.transform(test_data)
-            dt_accuracy = evaluator.evaluate(dt_predictions)
-            
-            self.pyspark_results = {
-                "PySpark Logistic Regression": lr_accuracy,
-                "PySpark Decision Tree": dt_accuracy
-            }
-            
-            return self.pyspark_results
-            
-        except Exception as e:
-            st.error(f"❌ Lỗi training PySpark models: {e}")
-            return {}
-    
-    def stop_spark(self):
-        """Dừng Spark Session"""
-        if self.spark:
-            self.spark.stop()
+
+    def handle_input_conflict(self):
+            # Nếu user chọn công ty → reset ô nhập từ khóa
+            if st.session_state.selectbox_company != st.session_state.prev_selectbox_company:
+                st.session_state.query_text = ""
+                st.session_state.prev_selectbox_company = st.session_state.selectbox_company
+                st.session_state.prev_query_text = ""
+
+            # Nếu user gõ từ khóa → reset chọn công ty
+            elif st.session_state.query_text != st.session_state.prev_query_text:
+                st.session_state.selectbox_company = "-- Chọn công ty --"
+                st.session_state.prev_query_text = st.session_state.query_text
+                st.session_state.prev_selectbox_company = "-- Chọn công ty --"
 
 # Đọc dữ liệu
 df = pd.read_excel('data/Overview_Companies.xlsx')
 cols_show = ["Company Name", "Company Type", "Company industry", "similarity"]
+
+# Load dữ liệu nếu chưa load
+# 2️⃣ Khởi tạo hệ thống nếu chưa có
+if not st.session_state.data_loaded:
+    with st.spinner("🔄 Đang load dữ liệu..."):
+        ml_system = CompanyRecommendationSystem()
+        ml_system.load_gensim_models()
+        ml_system.load_cosine_models()
+        st.session_state.ml_system = ml_system
+        st.session_state.data_loaded = True
+else:
+    ml_system = st.session_state.ml_system
 
 #------- I.Giao diện Streamlit -----
 # 1.1. Hình ảnh đầu tiên
@@ -903,13 +533,12 @@ st.sidebar.markdown("Email: thaofpham@gmail.com")
 # 1.3.Các tab nằm ngang
 tab1, tab2, tab3 = st.tabs(["Business Objective", "Build Project", "New Prediction"])
 
-
 #------- II.Nội dung chính từng tab -----
 #2.1. Tóm tắt dự án (Business Objective)
 with tab1:
     #2.1.1.  Company Similarity
     if page == "Company Similarity":
-        st.header("COMPANY SIMILARITY")
+        st.markdown('<h1 class="main-header">🎯 Business Objective</h1>', unsafe_allow_html=True)
         st.markdown("""
         ### 🔍 Đề xuất công ty tương tự và phù hợp
 
@@ -931,6 +560,8 @@ with tab1:
         - **Gensim**: Vector hóa văn bản bằng TF-IDF  
         - **Cosine Similarity**: Đo độ tương đồng giữa các vector mô tả
         """)
+
+        print("✅ Dictionaries loaded:", len(ml_system.text_processor.english_dict))
     #2.1.2.  Recommendation
     elif page == "Recommendation":
         st.markdown('<h1 class="main-header">🎯 Business Objective</h1>', unsafe_allow_html=True)
@@ -967,249 +598,145 @@ with tab1:
 
 #2.2. Mô tả thuật toán (Build Project)       
 with tab2:
-    # Load dữ liệu nếu chưa load
-    if not st.session_state.data_loaded:
-        with st.spinner("🔄 Đang load dữ liệu..."):
-            ml_system = CompanyRecommendationSystem()
-            if ml_system.load_data():
-                ml_system.load_gensim_models()
-                ml_system.load_cosine_models()
-                st.session_state.ml_system = ml_system
-                st.session_state.data_loaded = True
-            else:
-                st.stop()
-
-    ml_system = st.session_state.ml_system
     #2.2.1. Company Similarity
     if page == "Company Similarity":
-        st.header("COMPANY SIMILARITY")
-        #a) Gensim
-        with st.expander("🧠 Thuật toán GENSIM"):
-            st.markdown('#### Bài toán 1:')
-            st.write('Dùng các nội dung phân loại (Company Type, Company industry, Company size,...) làm dữ liệu đầu vào')
-            st.image('images/gen1_dau vao.png')
-            st.write('Dùng gensim tạo từ điển dictionary và từ điển tần số từ corpus')
-            st.image('images/gen1_dictionary.png')
-            st.image('images/gen1_copus.png')
-            st.write('Vector hóa bằng tf-idf để tạo ma trận thưa thớt')
-            st.write('Lấy vector tf-idf của 1 công ty được chọn rồi tính tỉ số tương tự so với ma trận thưa')
-            st.write('Sắp xếp và lấy top5')
-            st.image('images/gen1_top5.png')
-            st.image('images/gen1_top5_df.png')
-            st.markdown('#### Bài toán 2:')
-            st.write("Dùng các nội dung mô tả tự do (Company overview, Our key skills, Why you'll love working here) làm dữ liệu đầu vào")
-            st.image('images/gen2_input.png')
-            st.write('Các bước tạo từ điển và tf-idf tương tự')
-            st.write('Từ khóa tìm kiếm sẽ được biến đổi thành vector và so sánh chỉ số tương tự')
-            st.write('sắp xếp và lấy công ty tương đồng nhất')
-            st.image('images/gen2_top1.png')
-        #b) Cosine-similarity
-        with st.expander("📊 Thuật toán COSINE-SIMILARITY" ):
-            st.markdown('#### Bài toán 1:')
-            st.write('Dùng các nội dung phân loại (Company Type, Company industry, Company size,...) làm dữ liệu đầu vào')
-            st.image('images/gen1_dau vao.png')
-            st.write('Vector hóa trực tiếp bằng tf-idf để tạo ma trận thưa thớt')
-            st.write('Tính tỉ số tương tự toàn bộ ma trận thưa')
-            st.write('Trực quan hóa các công ty có chỉ số tương tự >0.5')
-            st.image('images/cos1_matran.png')
-            st.write('Chọn 1 công ty, thuật toán sẽ lấy hàng ngang, sắp xếp và lấy top5')
-            st.image('images/cos1_top5.png')
-            st.image('images/cos1_top5_df.png')
-            st.markdown('#### Bài toán 2:')
-            st.write("Dùng các nội dung mô tả tự do (Company overview, Our key skills, Why you'll love working here) làm dữ liệu đầu vào")
-            st.image('images/gen2_input.png')
-            st.write('Các bước tạo tf-idf tương tự')
-            st.write('Từ khóa tìm kiếm sẽ được biến đổi thành vector và so sánh chỉ số tương tự')
-            st.write('sắp xếp và lấy công ty tương đồng nhất')
-            st.image('images/cos2_top1.png')
-    
+        st.markdown('<h1 class="main-header">🔨 Build Project</h1>', unsafe_allow_html=True)
+        #a) Mô tả thuật toán
+        st.markdown("#### ⚙️ MODEL DESCRIPTION")
+        #Gensim
+        with st.expander("🧠 GENSIM"):
+            st.markdown("""
+            #### **📝 Bài toán 1: Dựa trên dữ liệu phân loại**
+    - Sử dụng: `Company Type`, `Company industry`, `Company size`, `Country`, `Working days`, `Overtime Policy`
+    - Tạo **dictionary**, **corpus**.
+    - Vector hóa bằng **TF-IDF**.
+    - Tính độ tương tự và chọn **Top 5 công ty giống nhất**.
+    """)
+            st.markdown("""
+            #### **📝 Bài toán 2: Dựa trên mô tả tự do**
+    - Dùng các trường: `Company Overview`, `Key Skills`, `Why you'll love working here`.
+    - Tạo TF-IDF và vector hóa từ **truy vấn người dùng**.
+    - So sánh và chọn **công ty phù hợp nhất**.
+    """)
+        #Cosine-similarity
+        with st.expander("📊 COSINE-SIMILARITY" ):
+            st.markdown("""
+            #### **📝 Bài toán 1: Dựa trên dữ liệu phân loại**
+    - Sử dụng: `Company Type`, `Company industry`, `Company size`, `Country`, `Working days`, `Overtime Policy`
+    - Vector hóa các trường phân loại bằng **TF-IDF**.
+    - Tính toán **cosine similarity** giữa các vector công ty.
+    - Lọc các cặp công ty có độ tương tự **lớn hơn 0.5** để trực quan hóa.
+    - Khi người dùng chọn 1 công ty:
+        + Lấy **hàng tương ứng trong ma trận độ tương tự**.
+        + **Sắp xếp** theo độ tương đồng giảm dần.
+        + Trả về **Top 5 công ty tương đồng nhất**.
+    """)
+            st.markdown("""
+            #### **📝 Bài toán 2: Dựa trên mô tả tự do**
+    - Dùng các trường: `Company Overview`, `Key Skills`, `Why you'll love working here`.
+    - Tạo **TF-IDF vector** từ các mô tả tự do của từng công ty.
+    - Biến đổi **truy vấn hoặc từ khóa người dùng nhập** thành vector TF-IDF.
+    - Tính toán **cosine similarity** giữa truy vấn và tất cả công ty.
+    - Trả về **công ty có độ tương đồng cao nhất** với truy vấn.
+    """) 
+        #b) EDA dữ liệu    
+        st.markdown("#### 🧭 Input Data EDA")
+        
+        tab4, tab5 = st.tabs(["📊 Categories Analysis", "📝 Free Text Analysis"])
+
+        with tab4:
+            st.image("images/eda_input_text_cot.png", caption="📊 Tổng quan 6 trường phân loại\n(Company Type, Industry, Size, Country, ...)")
+            st.markdown("")
+            st.image("images/eda_company_type_piechart.png", caption="🥧 Phân phối các công ty dựa trên loại hình hoạt động")
+
+        with tab5:
+            st.image("images/eda_noidungcty_word_cloud.png", caption="☁️ WordCloud: Tổng hợp mô tả công ty\n(Overview, Skills, Why you'll love)")
+            st.markdown("")
+            st.image("images/eda_kill_word_cloud.png", caption="🎯 Kỹ năng yêu cầu tại các công ty")
+                                
     #2.2.2. Recommendation
     elif page == "Recommendation":
-        st.header("COMPAYNY SIMILARITY")
         st.markdown('<h1 class="main-header">🔨 Build Project</h1>', unsafe_allow_html=True)
-    
-        # Khởi tạo và load dữ liệu
-        if not st.session_state.data_loaded:
-            with st.spinner("🔄 Đang load dữ liệu thực..."):
-                ml_system = CompanyRecommendationSystem()
-                if ml_system.load_data():
-                    st.session_state.ml_system = ml_system
-                    st.session_state.data_loaded = True
-                else:
-                    st.stop()
-        
-        # Training options
-        st.markdown("### 🚀 Training Machine Learning Models:")
-        
-        sklearn_training = st.button("🔬 Train Sklearn Models", use_container_width=True)
-        
-        if PYSPARK_AVAILABLE:
-            pyspark_training = st.button("⚡ Train PySpark Models", use_container_width=True)
-        
-        else:
-            st.info("💡 **PySpark không khả dụng** - Chỉ sử dụng Sklearn Models")
-        
-        #a) Sklearn Training
-        if sklearn_training and st.session_state.data_loaded:
-            if not st.session_state.model_trained:
-                with st.spinner("🤖 Đang training sklearn models..."):
-                    ml_system = st.session_state.ml_system
-                    
-                    if ml_system.prepare_features():
-                        results, best_model_name, best_acc, best_k = ml_system.train_models()
-                        
-                        if results:
-                            st.session_state.model_trained = True
-                            st.session_state.training_results = results
-                            st.session_state.best_model_name = best_model_name
-                            st.session_state.best_acc = best_acc
-                            st.session_state.best_k = best_k
-                            st.success("✅ Sklearn Training hoàn tất!")
-                            st.rerun()
-        
-        #b) PySpark Training
-        if PYSPARK_AVAILABLE and 'pyspark_training' in locals() and pyspark_training:
-            if not st.session_state.get('pyspark_trained', False):
-                if not st.session_state.model_trained:
-                    st.warning("⚠️ Vui lòng train sklearn models trước!")
-                else:
-                    with st.spinner("⚡ Đang training PySpark models..."):
-                        try:
-                            ml_system = st.session_state.ml_system
-                            pyspark_system = PySparkMLSystem()
-                            
-                            if pyspark_system.initialize_spark():
-                                # Chuẩn bị dữ liệu
-                                X_concat = pd.concat([
-                                    ml_system.df_structured_encoded.reset_index(drop=True),
-                                    pd.DataFrame(
-                                        ml_system.tfidf.transform(ml_system.clustercty['combined_text']).toarray(),
-                                        columns=ml_system.tfidf.get_feature_names_out()
-                                    )
-                                ], axis=1)
-                                
-                                cluster_labels = ml_system.clustercty['cluster'].values
-                                
-                                if pyspark_system.prepare_spark_data(X_concat, cluster_labels):
-                                    pyspark_results = pyspark_system.train_pyspark_models()
-                                    
-                                    if pyspark_results:
-                                        st.session_state.pyspark_trained = True
-                                        st.session_state.pyspark_results = pyspark_results
-                                        st.success("✅ PySpark Training hoàn tất!")
-                                        st.rerun()
-                                
-                                pyspark_system.stop_spark()
-                            
-                        except Exception as e:
-                            st.error(f"❌ Lỗi PySpark training: {e}")
-        
-        # Hiển thị kết quả
-        if st.session_state.get('model_trained', False):
-            st.markdown("### 📊 Kết quả Training")
-            
-            ml_system = st.session_state.ml_system
-            
-            # Metrics overview
+
+        try:
+            with open("data/training_meta.json", "r", encoding="utf-8") as f:
+                training_meta = json.load(f)
+            sklearn_df = pd.read_csv("data/sklearn_results.csv")
+            with open("data/pyspark_results.json", "r", encoding="utf-8") as f:
+                pyspark_results = json.load(f)
+            with open("models/cluster_data.pkl", "rb") as f:
+                clustercty = pickle.load(f)
+
+            st.success("✅ Đã load kết quả từ mô hình đã train!")
+
+            # Hiển thị metric tổng quan
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("📊 Số công ty", len(ml_system.clustercty))
+                st.metric("📊 Tổng công ty", len(clustercty))
             with col2:
-                st.metric("🎯 Số clusters", st.session_state.best_k)
+                st.metric("🎯 Số cluster", clustercty['cluster'].nunique())
             with col3:
-                st.metric("🏆 Best Model", st.session_state.best_model_name)
+                st.metric("🏆 Best model", training_meta["best_model"])
             with col4:
-                st.metric("📈 Best Accuracy", f"{st.session_state.best_acc:.3f}")
-            
-            # Sklearn Results
-            st.markdown("#### 🔬 Sklearn Models Results:")
-            sklearn_results_df = pd.DataFrame(st.session_state.training_results, columns=['Mô hình', 'Accuracy'])
-            sklearn_results_df['Accuracy (%)'] = (sklearn_results_df['Accuracy'] * 100).round(2)
-            sklearn_results_df['Framework'] = 'Sklearn'
-            
-            st.dataframe(sklearn_results_df[['Mô hình', 'Accuracy (%)', 'Framework']], use_container_width=True)
-            
-            # PySpark Results (if available)
-            if st.session_state.get('pyspark_trained', False):
-                st.markdown("#### ⚡ PySpark Models Results:")
-                pyspark_results = st.session_state.pyspark_results
-                pyspark_results_df = pd.DataFrame(list(pyspark_results.items()), columns=['Mô hình', 'Accuracy'])
-                pyspark_results_df['Accuracy (%)'] = (pyspark_results_df['Accuracy'] * 100).round(2)
-                pyspark_results_df['Framework'] = 'PySpark'
-                
-                st.dataframe(pyspark_results_df[['Mô hình', 'Accuracy (%)', 'Framework']], use_container_width=True)
-                
-                # Combined comparison
-                st.markdown("#### 🆚 Sklearn vs PySpark Comparison:")
-                combined_results = pd.concat([
-                    sklearn_results_df[['Mô hình', 'Accuracy (%)', 'Framework']],
-                    pyspark_results_df[['Mô hình', 'Accuracy (%)', 'Framework']]
-                ], ignore_index=True)
-                
-                fig_comparison = px.bar(
-                    combined_results, 
-                    x='Mô hình', 
-                    y='Accuracy (%)',
-                    color='Framework',
-                    title="Sklearn vs PySpark Models Comparison",
-                    barmode='group'
-                )
-                fig_comparison.update_layout(xaxis_tickangle=-45)
-                st.plotly_chart(fig_comparison, use_container_width=True)
-            
-            # Sklearn visualization
-            fig_sklearn = px.bar(
-                sklearn_results_df, 
-                x='Mô hình', 
-                y='Accuracy (%)',
-                title="Sklearn Models Performance",
-                color='Accuracy (%)',
-                color_continuous_scale='viridis'
-            )
-            fig_sklearn.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_sklearn, use_container_width=True)
-            
-            # Cluster analysis
-            st.markdown("#### 🎯 Cluster Analysis:")
-            if 'cluster' in ml_system.clustercty.columns:
-                cluster_stats = ml_system.clustercty.groupby('cluster').agg({
-                    'Company Name': 'count',
-                    'Company industry': lambda x: x.mode().iloc[0] if not x.mode().empty else 'N/A',
-                    'sentiment_group': lambda x: x.mode().iloc[0] if not x.mode().empty else 'N/A'
-                })
-                cluster_stats.columns = ['Số công ty', 'Ngành chủ đạo', 'Sentiment chủ đạo']
-                st.dataframe(cluster_stats, use_container_width=True)
-                
-                # Cluster distribution
-                fig_cluster = px.pie(
-                    values=cluster_stats['Số công ty'],
-                    names=cluster_stats.index,
-                    title="Phân bố công ty theo Cluster"
-                )
-                st.plotly_chart(fig_cluster, use_container_width=True)
+                st.metric("📈 Accuracy", f"{training_meta['best_accuracy'] * 100:.2f}%")
+
+            # Hiển thị bảng và biểu đồ
+            st.markdown("### 📊 So sánh các mô hình")
+            st.image("images/comparison_all_models.png", caption="So sánh mô hình Sklearn & PySpark", use_container_width=True)
+
+            st.markdown("### 🍰 Phân bố công ty theo Cluster")
+            st.image("images/cluster_distribution_pie.png", caption="Tỷ lệ các cụm công ty", use_container_width=True)
+
+            st.markdown("### 🔍 Kết quả chi tiết:")
+            st.subheader("🔬 Sklearn Models")
+            sklearn_df = pd.read_csv("data/sklearn_results.csv", index_col=0)
+            sklearn_df.reset_index(inplace=True)
+            sklearn_df.rename(columns={"index": "Model"}, inplace=True)
+            sklearn_df["Accuracy (%)"] = sklearn_df["Sklearn Accuracy"] * 100
+            st.dataframe(sklearn_df[["Model", "Sklearn Accuracy", "Accuracy (%)"]], use_container_width=True)
+
+
+
+            st.subheader("⚡ PySpark Models")
+            pyspark_df = pd.DataFrame.from_dict(pyspark_results, orient="index", columns=["Accuracy"])
+            pyspark_df["Accuracy (%)"] = pyspark_df["Accuracy"] * 100
+            st.dataframe(pyspark_df[["Accuracy (%)"]], use_container_width=True)
+
+        except Exception as e:
+            st.error(f"❌ Không thể load kết quả: {e}")
+            st.info("📌 Vui lòng chạy file `train_and_save_model.py` trước.")
 
 #2.3. Dự đoán kết quả (New Prediction)
 with tab3:
     #2.3.1.Company Similarity 
     if page == "Company Similarity":
-        st.header('COMPANY SIMILARITY')
-        #input      
+
+        st.markdown('<h1 class="main-header">🔮 COMPANY SIMILARITY</h1>', unsafe_allow_html=True)
+        #input
+        ml_system.handle_input_conflict()  
+
         col1, col2, col3 = st.columns([4, 1.5, 1.5])
-        with col1:
-            selected_name, selected_id = ml_system.suggest_company_name(df, key="selectbox_company_1")
-            query_text = st.text_input("Hoặc nhập từ khóa:")
+        with col1:               
+            # Đặt mặc định nếu chưa có key trong session_state
+            selected_name, selected_id = ml_system.suggest_company_name(df, key="selectbox_company")
+
+            query_text = st.text_area("Or type a keyword: ", 
+                                    placeholder="VD: CNTT chuyên về mảng Blockchain, AI. Công ty làm việc với khách hàng Nhật Bản...",
+                                    height=70,
+                                    key="query_text")
+      
         with col2:
-            selected_model = st.selectbox("📋 Thuật toán:", ["Gensim", "Cosine-similarity"], key="selectbox_algo")
+            selected_model = st.selectbox("📋 Model:", ["Gensim", "Cosine-similarity"], key="selectbox_algo")
         with col3:
-            top_n = st.slider("🔢 Số công ty tương tự:", 1, 10, 5)
+            top_n = st.slider("🔢 Number of results:", 1, 10, 5)
 
         # ✅ Thêm nút tìm kiếm
-        tinh_button = st.button("🔍 Tìm kiếm:", use_container_width=True)   
+        tinh_button = st.button("🔍 Search:", use_container_width=True)   
 
         # ✅ Chỉ chạy nếu nhấn nút
         if tinh_button:
-            if selected_model=="Gensim":
-                if query_text.strip():
+            if st.session_state.selectbox_algo=="Gensim":
+                if st.session_state.query_text.strip():
                     # PROCESS
                     df_gem_search, top_similar_gem_search, query_text = ml_system.search_similar_companies_gem(
                         query_text=query_text,
@@ -1225,22 +752,9 @@ with tab3:
                     if df_gem_search is not None and not df_gem_search.empty:
                         search_id, search_name = top_similar_gem_search[0]
 
-                        st.subheader("🏢 Công ty tương đồng với từ khóa tìm kiếm")
-                        subtab1, subtab2 = st.tabs(["📊 Biểu đồ", "📋 Dữ liệu"])
-                        with subtab1:
-                            ml_system.draw_similarity_bar_chart(df_gem_search)
-                        with subtab2:
-                            st.dataframe(df_gem_search[cols_show].style.format({"similarity": "{:.4f}"}))
-                                            
-                        st.subheader("🏢 Thông tin công ty tương tự")
+                        ml_system.show_similarity_results(df_gem_search, cols_show=cols_show)
 
-                        for idx, row in df_gem_search.iterrows():
-                            ml_system.show_company_detail(
-                                row,
-                                title=f"{row['Company Name']} (Similarity: {row['similarity']:.4f})"
-                            )
-
-                elif selected_id:
+                elif st.session_state.selectbox_company != "-- Chọn công ty --":
                     # PROCESS
                     df_gem_find, top_similar_gem_find, selected_id = ml_system.find_similar_companies_gem(
                         company_id=selected_id,
@@ -1254,26 +768,13 @@ with tab3:
                     st.subheader("🏢 Thông tin công ty đang tìm kiếm")
                     ml_system.show_company_detail(df[df['id'] == selected_id].iloc[0])
 
-                    st.subheader("🏙️ Các công ty tương tự")
-                    subtab1, subtab2 = st.tabs(["📊 Biểu đồ", "📋 Dữ liệu"])
-                    with subtab1:
-                        ml_system.draw_similarity_bar_chart(df_gem_find)
-                    with subtab2:
-                        st.dataframe(df_gem_find[cols_show].style.format({"similarity": "{:.4f}"}))
-                                        
-                    st.subheader("🏢 Thông tin công ty tương tự")
-
-                    for idx, row in df_gem_find.iterrows():
-                        ml_system.show_company_detail(
-                            row,
-                            title=f"{row['Company Name']} (Similarity: {row['similarity']:.4f})"
-                        )
+                    ml_system.show_similarity_results(df_gem_find, cols_show=cols_show)
                 else:
                     # Cảnh báo người dùng chưa nhập gì cả
                     st.warning("⚠️ Vui lòng chọn công ty hoặc nhập từ khóa.")
                 
-            elif selected_model=="Cosine-similarity": 
-                if query_text.strip():
+            elif st.session_state.selectbox_algo=="Cosine-similarity": 
+                if st.session_state.query_text.strip():
                     #process
                     top_similarity_cos_search , df_cos_search, query_text_2 = ml_system.search_similar_companies_cos(
                         query_text_2=query_text, 
@@ -1285,20 +786,9 @@ with tab3:
                     if df_cos_search is not None and not df_cos_search.empty:
                         search_id, search_name = top_similarity_cos_search[0]
 
-                        st.subheader("🏢 Công ty tương đồng với từ khóa tìm kiếm")
-                        subtab1, subtab2 = st.tabs(["📊 Biểu đồ", "📋 Dữ liệu"])
-                        with subtab1:
-                            ml_system.draw_similarity_bar_chart(df_cos_search)
-                        with subtab2:
-                            st.dataframe(df_cos_search[cols_show].style.format({"similarity": "{:.4f}"}))
-                                            
-                        st.subheader("🏢 Thông tin công ty tương tự")
-                        for idx, row in df_cos_search.iterrows():
-                            ml_system.show_company_detail(
-                                row,
-                                title=f"{row['Company Name']} (Similarity: {row['similarity']:.4f})"
-                            )
-                elif selected_id:
+                        ml_system.show_similarity_results(df_cos_search, cols_show=cols_show)
+                
+                elif st.session_state.selectbox_company != "-- Chọn công ty --":
                     #process
                     top_similar_cos_find, df_cos_find, selected_id = ml_system.find_similar_companies_cos(
                         ml_system.cosine_index, 
@@ -1308,20 +798,8 @@ with tab3:
                     st.subheader("🏢 Thông tin công ty đang tìm kiếm")
                     ml_system.show_company_detail(df[df['id'] == selected_id].iloc[0])
 
-                    st.subheader("🏙️ Các công ty tương tự")
-        
-                    subtab1, subtab2 = st.tabs(["📊 Biểu đồ", "📋 Dữ liệu"])
-                    with subtab1:
-                        ml_system.draw_similarity_bar_chart(df_cos_find)
-                    with subtab2:
-                        st.dataframe(df_cos_find[cols_show].style.format({"similarity": "{:.4f}"}))
-                                            
-                    st.subheader("🏢 Thông tin công ty tương tự")
-                    for idx, row in df_cos_find.iterrows():
-                        ml_system.show_company_detail(
-                            row,
-                            title=f"{row['Company Name']} (Similarity: {row['similarity']:.4f})"
-                        ) 
+                    ml_system.show_similarity_results(df_cos_find, cols_show=cols_show)
+                
                 else:
                     # Cảnh báo người dùng chưa nhập gì cả
                     st.warning("⚠️ Vui lòng chọn công ty hoặc nhập từ khóa.")     
@@ -1329,125 +807,115 @@ with tab3:
     #2.3.2. Recommendation
     elif page == "Recommendation":
         st.markdown('<h1 class="main-header">🔮 RECOMMENDATION</h1>', unsafe_allow_html=True)
-        
-        if not st.session_state.get('model_trained', False):
-            st.warning("⚠️ Vui lòng train model ở mục 'Build Project' trước khi sử dụng tính năng này!")
-            st.stop()
-        
-        ml_system = st.session_state.ml_system
-        
-        st.markdown("### 🎯 Nhập thông tin để nhận đề xuất công ty phù hợp")
-        
-        # User input form
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            company_type = st.selectbox("🏢 Loại công ty:", ml_system.clustercty['Company Type'].unique())
-            company_industry = st.selectbox("🏭 Ngành nghề:", ml_system.clustercty['Company industry'].unique())
-            company_size = st.selectbox("👥 Quy mô công ty:", ml_system.clustercty['Company size'].unique())
-        
-        with col2:
-            country = st.selectbox("🌍 Quốc gia:", ml_system.clustercty['Country'].unique())
-            working_days = st.selectbox("📅 Ngày làm việc:", ml_system.clustercty['Working days'].unique())
-            overtime_policy = st.selectbox("⏰ Chính sách OT:", ml_system.clustercty['Overtime Policy'].unique())
-        
-        # Text input
-        text_input = st.text_area(
-            "📝 Mô tả mong muốn của bạn:",
+        try:
+            # Load các thành phần đã huấn luyện
+            with open("models/best_model.pkl", "rb") as f:
+                best_model = pickle.load(f)
+            with open("models/tfidf.pkl", "rb") as f:
+                tfidf = pickle.load(f)
+            with open("models/pca.pkl", "rb") as f:
+                pca = pickle.load(f)
+            with open("models/encoded_columns.pkl", "rb") as f:
+                encoded_columns = pickle.load(f)
+            with open("models/cluster_data.pkl", "rb") as f:
+                clustercty = pickle.load(f)
+
+            processor = TextProcessor()
+            st.success("✅ Mô hình và dữ liệu đã được tải thành công!")
+
+            # Nhập input từ người dùng
+            col1, col2 = st.columns(2)
+            with col1:
+                company_type = st.selectbox("🏢 Loại công ty", clustercty['Company Type'].unique())
+                company_industry = st.selectbox("🏭 Ngành nghề", clustercty['Company industry'].unique())
+                company_size = st.selectbox("👥 Quy mô", clustercty['Company size'].unique())
+            with col2:
+                country = st.selectbox("🌍 Quốc gia", clustercty['Country'].unique())
+                working_days = st.selectbox("📅 Ngày làm việc", clustercty['Working days'].unique())
+                ot_policy = st.selectbox("⏰ Chính sách OT", clustercty['Overtime Policy'].unique())
+
+            text_input = st.text_area("📝 Mô tả mong muốn của bạn:",
             placeholder="Ví dụ: Tôi muốn làm việc trong môi trường công nghệ, sử dụng AI và machine learning, có cơ hội phát triển...",
-            height=100
-        )
-        
-        # Similarity threshold
-        threshold = st.slider("🎯 Ngưỡng độ tương đồng:", 0.0, 1.0, 0.1, 0.05)
-        
-        if st.button("🔮 Dự đoán và Đề xuất", use_container_width=True):
-            if text_input.strip():
-                with st.spinner("🤖 AI đang phân tích và đề xuất..."):
-                    # Chuẩn bị input
-                    user_input = {
-                        'Company Type': company_type,
-                        'Company industry': company_industry,
-                        'Company size': company_size,
-                        'Country': country,
-                        'Working days': working_days,
-                        'Overtime Policy': overtime_policy
-                    }
-                    
-                    # Lấy đề xuất
-                    matched_companies, predicted_cluster = ml_system.recommend_companies(
-                        user_input, text_input, threshold
-                    )
-                    
-                    if not matched_companies.empty:
-                        # Hiển thị kết quả prediction
+            height=100)
+            threshold = st.slider("🎯 Ngưỡng độ tương đồng:", 0.0, 1.0, 0.1, 0.05)
+
+            if st.button("🔍 Đề xuất công ty", use_container_width=True):
+                if not text_input.strip():
+                    st.warning("⚠️ Vui lòng nhập mô tả mong muốn của bạn.")
+                    st.stop()
+
+                with st.spinner("🤖 AI đang phân tích..."):
+                    cleaned_text = processor.clean_pipeline(text_input)
+                    text_vec = tfidf.transform([cleaned_text])
+
+                    input_df = pd.DataFrame([{
+                        "Company Type": company_type,
+                        "Company industry": company_industry,
+                        "Company size": company_size,
+                        "Country": country,
+                        "Working days": working_days,
+                        "Overtime Policy": ot_policy
+                    }])
+                    input_encoded = pd.get_dummies(input_df)
+                    for col in encoded_columns:
+                        if col not in input_encoded.columns:
+                            input_encoded[col] = 0
+                    input_encoded = input_encoded[encoded_columns]
+
+                    X_full = pd.concat([
+                        input_encoded.reset_index(drop=True),
+                        pd.DataFrame(text_vec.toarray(), columns=tfidf.get_feature_names_out())
+                    ], axis=1)
+                    X_pca = pca.transform(X_full)
+                    pred_cluster = best_model.predict(X_pca)[0]
+
+                    from sklearn.metrics.pairwise import cosine_similarity
+                    all_vecs = tfidf.transform(clustercty["combined_text"])
+                    sim_scores = cosine_similarity(text_vec, all_vecs).flatten()
+
+                    clustercty["similarity_score"] = sim_scores
+                    matched = clustercty[(clustercty["cluster"] == pred_cluster) & (clustercty["similarity_score"] >= threshold)]
+                    matched = matched.sort_values(by="similarity_score", ascending=False).head(10)
+
+                    if not matched.empty:
                         st.markdown(f"""
                         <div class="prediction-container">
                             <h3>🎯 Kết quả Dự đoán</h3>
-                            <p><strong>Cluster được dự đoán:</strong> {predicted_cluster}</p>
-                            <p><strong>Số công ty phù hợp:</strong> {len(matched_companies)}</p>
+                            <p><strong>Cluster được dự đoán:</strong> {pred_cluster}</p>
+                            <p><strong>Số công ty phù hợp:</strong> {len(matched)}</p>
                             <p><strong>Ngưỡng tương đồng:</strong> {threshold}</p>
                         </div>
                         """, unsafe_allow_html=True)
-                        
-                        st.markdown("### 🏆 Top công ty được đề xuất:")
-                        
-                        # Hiển thị từng công ty
-                        for idx, (_, company) in enumerate(matched_companies.iterrows(), 1):
-                            similarity = company['similarity_score']
-                            
-                            with st.expander(f"#{idx} 🏢 {company['Company Name']} - Similarity: {similarity:.3f}"):
-                                col1, col2 = st.columns(2)
-                                
-                                with col1:
-                                    st.markdown(f"**🏭 Ngành:** {company.get('Company industry', 'N/A')}")
-                                    st.markdown(f"**👥 Quy mô:** {company.get('Company size', 'N/A')}")
-                                    st.markdown(f"**🌍 Quốc gia:** {company.get('Country', 'N/A')}")
-                                    st.markdown(f"**🏢 Loại:** {company.get('Company Type', 'N/A')}")
-                                
-                                with col2:
-                                    st.markdown(f"**📅 Làm việc:** {company.get('Working days', 'N/A')}")
-                                    st.markdown(f"**⏰ OT Policy:** {company.get('Overtime Policy', 'N/A')}")
-                                    st.markdown(f"**😊 Sentiment:** {company.get('sentiment_group', 'N/A')}")
-                                    st.markdown(f"**🔑 Keywords:** {company.get('keyword', 'N/A')}")
-                                
-                                # Similarity score highlight
-                                st.markdown(f"""
-                                <div class="similarity-score">
-                                    🎯 Độ tương đồng: {similarity:.3f} ({similarity*100:.1f}%)
-                                </div>
-                                """, unsafe_allow_html=True)
-                                
-                                # Company details
-                                if 'Company overview_new' in company:
-                                    st.markdown("**📝 Mô tả công ty:**")
-                                    st.write(company.get('Company overview_new', 'Không có thông tin'))
-                                
-                                if "Why you'll love working here_new" in company:
-                                    st.markdown("**💝 Tại sao bạn sẽ yêu thích:**")
-                                    st.write(company.get("Why you'll love working here_new", 'Không có thông tin'))
-                                
-                                if 'Our key skills_new' in company:
-                                    st.markdown("**🔧 Kỹ năng cần thiết:**")
-                                    st.write(company.get('Our key skills_new', 'Không có thông tin'))
-                        
-                        # Visualization
-                        if len(matched_companies) > 1:
+
+                        st.markdown("### 🏆 Các công ty được đề xuất:")
+
+                        # 💡 Dùng lại show_company_detail()
+                        ml_system = CompanyRecommendationSystem()
+                        ml_system.clustercty = clustercty  # truyền data vào class để hiển thị nội dung
+
+                        for idx, row in matched.iterrows():
+                            ml_system.show_company_detail(
+                                row,
+                                title=f"#{idx+1} {row['Company Name']} - Similarity: {row['similarity_score']:.3f}",
+                                expanded=False
+                            )
+
+                        if len(matched) > 1:
                             st.markdown("### 📊 Biểu đồ độ tương đồng:")
-                            fig_similarity = px.bar(
-                                x=matched_companies['Company Name'],
-                                y=matched_companies['similarity_score'],
-                                title="Độ tương đồng của các công ty được đề xuất",
+                            fig = px.bar(
+                                matched,
+                                x="Company Name",
+                                y="similarity_score",
+                                title="🎯 Độ tương đồng các công ty được đề xuất",
                                 labels={'x': 'Công ty', 'y': 'Độ tương đồng'}
                             )
-                            fig_similarity.update_layout(xaxis_tickangle=-45)
-                            st.plotly_chart(fig_similarity, use_container_width=True)
-                    
+                            fig.update_layout(xaxis_tickangle=-45)
+                            st.plotly_chart(fig, use_container_width=True)
                     else:
-                        st.warning(f"❌ Không tìm thấy công ty phù hợp với ngưỡng tương đồng {threshold}")
-                        st.info("💡 **Gợi ý:** Thử giảm ngưỡng tương đồng hoặc thay đổi mô tả mong muốn")
-            else:
-                st.warning("⚠️ Vui lòng nhập mô tả mong muốn của bạn!")
+                        st.warning("❌ Không tìm thấy công ty phù hợp với tiêu chí đã chọn.")
+
+        except Exception as e:
+            st.error(f"❌ Lỗi khi tải mô hình hoặc dữ liệu: {e}")
     
     
 # Adding a footer
@@ -1485,9 +953,3 @@ text-align: center;
 </div>
 """
 st.markdown(footer,unsafe_allow_html=True)
-
-
-
-
-
-
